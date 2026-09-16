@@ -37,18 +37,28 @@ DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 # with LLM_MODEL if this changes again.
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
-# openai/gpt-oss-120b is a reasoning model, and Groq bills its internal
-# reasoning tokens against max_tokens along with the visible answer. At 350
-# this was silently empty in production: traced calls (eval/trace_pipeline.py)
-# showed the model spending up to 348 of 350 tokens reasoning and returning 2
-# tokens of visible output - every one of the 15 traced risk cards got either
-# nothing or a sentence cut off mid-word. The longest complete visible output
-# observed was ~135 tokens; 1200 leaves headroom for reasoning and the full
-# two-paragraph answer without ever repeating that failure. Don't lower this
-# back down without re-running the trace to confirm reasoning spend hasn't
-# grown - see also reasoning_effort="low" below, which is the other half of
-# keeping reasoning spend bounded.
-MAX_COMPLETION_TOKENS = 1200
+# Historical origin of this budget: openai/gpt-oss-120b (the previous
+# provider) bills its internal reasoning tokens against max_tokens along with
+# the visible answer. At 350 this was silently empty in production: traced
+# calls (eval/trace_pipeline.py) showed the model spending up to 348 of 350
+# tokens reasoning and returning 2 tokens of visible output. 1200 was
+# calibrated against that provider's observed reasoning spend and fixed it
+# there.
+#
+# Recalibrated for the current provider: gemini-3.1-flash-lite hides its
+# internal reasoning spend even more thoroughly than gpt-oss did - it doesn't
+# report it via completion_tokens_details (always null on this provider;
+# confirmed via the raw response's extra_content.google.thought_signature
+# field, present on every call whether or not reasoning_effort is set) - and
+# a repeated-trial trace (5 reps x 5 real findings) found that spend spiking
+# per call from a steady ~125-token baseline up to 1150+ tokens, occasionally
+# enough to truncate the visible answer mid-sentence at 1200. 2500 was
+# calibrated against the largest spike actually observed across those 25
+# calls, not just the smallest margin that happened to work once. Don't
+# lower this back down without re-running that repeated trial - a single
+# clean-looking run is not evidence here, since the failure is
+# non-deterministic per call.
+MAX_COMPLETION_TOKENS = 2500
 
 PROMPT_TEMPLATE = """You are writing one entry in a board-level cyber risk briefing for TawasolPay, a fintech company.
 

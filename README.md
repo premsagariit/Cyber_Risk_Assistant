@@ -1,5 +1,6 @@
 ---
 title: Cyber Risk Assistant
+<<<<<<< HEAD
 emoji: 🛡️
 colorFrom: blue
 colorTo: green
@@ -407,3 +408,13 @@ finding 5.
 `shared-accounts` (IA-2) and `secrets-in-build-logs` (IA-5) — both misses as of the previous
 round — are clean hits now; see finding 5 above and the `secrets-in-build-logs` example in
 "Evaluating the retrieval lane."
+=======
+emoji: 📚
+colorFrom: blue
+colorTo: indigo
+sdk: static
+pinned: false
+---
+
+Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+>>>>>>> cee2a77ed0e01cf44f649f048d323a4e5280f71c
