@@ -1,0 +1,11 @@
+.env
+.venv/
+.venv*/
+venv/
+__pycache__/
+*.pyc
+chroma_db/
+.pytest_cache/
+.streamlit/secrets.toml
+eval/traces/
+eval/
