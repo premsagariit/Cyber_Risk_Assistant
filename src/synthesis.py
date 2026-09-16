@@ -16,7 +16,7 @@ after whichever provider happens to be configured today - see README's
 
 import os
 
-from openai import BadRequestError, OpenAI
+from openai import OpenAI
 
 from .models import RiskFinding
 
@@ -46,18 +46,27 @@ DEFAULT_MODEL = "gemini-3.1-flash-lite"
 # there.
 #
 # Recalibrated for the current provider: gemini-3.1-flash-lite hides its
-# internal reasoning spend even more thoroughly than gpt-oss did - it doesn't
-# report it via completion_tokens_details (always null on this provider;
+# internal reasoning spend even more thoroughly than gpt-oss did - it never
+# reports it via completion_tokens_details (always null on this provider;
 # confirmed via the raw response's extra_content.google.thought_signature
-# field, present on every call whether or not reasoning_effort is set) - and
-# a repeated-trial trace (5 reps x 5 real findings) found that spend spiking
-# per call from a steady ~125-token baseline up to 1150+ tokens, occasionally
-# enough to truncate the visible answer mid-sentence at 1200. 2500 was
-# calibrated against the largest spike actually observed across those 25
-# calls, not just the smallest margin that happened to work once. Don't
-# lower this back down without re-running that repeated trial - a single
-# clean-looking run is not evidence here, since the failure is
-# non-deterministic per call.
+# field, present on every call). A repeated trial (5 reps x the 5 real
+# findings, 25 calls) with reasoning_effort="low" - the setting inherited
+# from the previous provider - found that hidden spend was usually a steady
+# ~125-token baseline but spiked to 1077-1231 tokens on 5 of the 25 calls,
+# occasionally enough to truncate the visible answer mid-sentence at the old
+# 1200 limit. 2500 was calibrated against that largest observed spike, not
+# just the smallest margin that happened to work once.
+#
+# That same trial is also why _create_completion() below no longer passes
+# reasoning_effort at all: dropping it entirely (letting the provider use its
+# own MINIMAL-thinking default) produced a zero-token hidden-reasoning gap on
+# all 25 calls, not just a smaller one. So under the config actually shipped,
+# 2500 is a generous safety margin rather than a tightly load-bearing number
+# - kept this large anyway as headroom against a future model or provider
+# change, not because the current setup needs it. Don't lower this back down,
+# and don't reintroduce reasoning_effort, without re-running the repeated
+# trial - a single clean-looking run is not evidence here, since the failure
+# is non-deterministic per call.
 MAX_COMPLETION_TOKENS = 2500
 
 PROMPT_TEMPLATE = """You are writing one entry in a board-level cyber risk briefing for TawasolPay, a fintech company.
@@ -116,21 +125,18 @@ def _describe_missing_controls(finding: RiskFinding) -> str:
     return ", ".join(missing) if missing else "none identified"
 
 
-def generate_explanation(finding: RiskFinding, top_control: dict, threat_report_text: str = "") -> str:
-    """Calls the LLM to turn pre-computed facts into two readable paragraphs.
+def _build_prompt(finding: RiskFinding, top_control: dict, threat_report_text: str) -> str:
+    """Fills PROMPT_TEMPLATE from a finding + retrieved control. Shared by
+    generate_explanation() and stream_explanation() so the two request paths
+    can never drift into sending two different prompts for the same inputs.
 
     threat_report_text is the raw text of synthetic_threat_report.md, passed
     straight through as context - it's short enough (about a page) that it
     doesn't need chunking or retrieval, so it goes in directly rather than
     through the vector store. Truncated defensively in case a future report
     is much longer than this one.
-
-    If the call fails for any reason - missing key, rate limit, network
-    blip - falls back to a plain template built from the same facts, so the
-    app still produces a usable (if less polished) result instead of
-    crashing the whole page.
     """
-    prompt = PROMPT_TEMPLATE.format(
+    return PROMPT_TEMPLATE.format(
         threat_report_excerpt=(threat_report_text[:3000] or "No advisory text available."),
         asset_name=finding.asset_name,
         asset_type=finding.asset_type,
@@ -152,6 +158,18 @@ def generate_explanation(finding: RiskFinding, top_control: dict, threat_report_
         control_excerpt=top_control["text"][:600],
     )
 
+
+def generate_explanation(finding: RiskFinding, top_control: dict, threat_report_text: str = "") -> str:
+    """Calls the LLM to turn pre-computed facts into two readable paragraphs,
+    as a single non-streaming string.
+
+    If the call fails for any reason - missing key, rate limit, network
+    blip - falls back to a plain template built from the same facts, so the
+    app still produces a usable (if less polished) result instead of
+    crashing the whole page.
+    """
+    prompt = _build_prompt(finding, top_control, threat_report_text)
+
     try:
         client = _get_client()
         model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
@@ -161,29 +179,66 @@ def generate_explanation(finding: RiskFinding, top_control: dict, threat_report_
         return _fallback_explanation(finding, top_control, exc)
 
 
-def _create_completion(client: OpenAI, model: str, prompt: str):
-    """Requests the completion, preferring reasoning_effort="low" to keep
-    the model's internal reasoning spend down where the provider supports it
-    (see MAX_COMPLETION_TOKENS above for why that matters).
+def stream_explanation(finding: RiskFinding, top_control: dict, threat_report_text: str = ""):
+    """Same call as generate_explanation() - same prompt, model, and
+    max_tokens - but yields text as it arrives instead of waiting for the
+    whole response. Meant for a UI that shows visible progress (e.g.
+    Streamlit's st.write_stream) rather than a blank wait behind a spinner.
 
-    reasoning_effort is a standard OpenAI-SDK field that Gemini's
-    OpenAI-compatibility layer understands (as did Groq's gpt-oss models, the
-    previous default) - but a custom LLM_MODEL/LLM_BASE_URL could point at a
-    provider that rejects it, so retry once without it rather than losing the
-    whole explanation over one unsupported kwarg. Any other failure (auth,
-    network, rate limit) is left to propagate to generate_explanation()'s own
-    fallback handling.
+    Falls back the same way generate_explanation() does: if the call fails
+    before any content arrives, or the stream ends having produced nothing
+    (an empty completion is indistinguishable from a hung request to
+    someone watching the UI), yields the plain-template fallback as its
+    only chunk - so a caller that does nothing but concatenate whatever
+    this yields still gets the same guarantee generate_explanation() gives.
     """
-    request = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": MAX_COMPLETION_TOKENS,
-    }
+    prompt = _build_prompt(finding, top_control, threat_report_text)
+
     try:
-        return client.chat.completions.create(reasoning_effort="low", **request)
-    except BadRequestError:
-        return client.chat.completions.create(**request)
+        client = _get_client()
+        model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
+        stream = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=MAX_COMPLETION_TOKENS,
+            stream=True,
+        )
+        received_any = False
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                received_any = True
+                yield delta
+        if not received_any:
+            yield _fallback_explanation(finding, top_control, RuntimeError("stream produced no content"))
+    except Exception as exc:  # noqa: BLE001 - same reasoning as generate_explanation()
+        yield _fallback_explanation(finding, top_control, exc)
+
+
+def _create_completion(client: OpenAI, model: str, prompt: str):
+    """Requests the completion. Deliberately does NOT pass reasoning_effort.
+
+    An earlier version of this function passed reasoning_effort="low",
+    inherited unmodified from the previous provider (Groq's gpt-oss models).
+    A repeated trial (5 reps x the 5 real findings, 25 calls per
+    configuration - see the comment on MAX_COMPLETION_TOKENS above) found
+    that setting caused gemini-3.1-flash-lite to spend a large, unpredictable
+    amount of hidden reasoning on 5 of 25 calls (1077-1231 tokens, vs. a
+    ~120-150 token baseline on the other 20) - a bimodal spike, not gradual
+    noise. Omitting the parameter entirely and trusting the provider's own
+    documented default (MINIMAL thinking for Flash-Lite) produced an exact
+    zero-token hidden-reasoning gap on all 25 calls in the same trial. The
+    inherited setting from a different provider was not actually the most
+    conservative option available for this one - the provider's own default
+    was. Don't re-add reasoning_effort here without re-running that trial.
+    """
+    return client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        max_tokens=MAX_COMPLETION_TOKENS,
+    )
 
 
 def _fallback_explanation(finding: RiskFinding, top_control: dict, error: Exception) -> str:

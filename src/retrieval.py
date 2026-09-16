@@ -76,11 +76,30 @@ def build_query_text(finding: RiskFinding) -> str:
 
     missing_text = ", ".join(missing) if missing else "no notable compensating control gaps"
 
-    return (
+    query = (
         f"{finding.vulnerability_name} ({finding.cve}) affecting a {finding.asset_type}, "
         f"{finding.asset_exposure.lower()}-facing, severity {finding.severity}. "
         f"Missing controls: {missing_text}."
     )
+
+    # ti_summary is a real, already-present data field (threat_intelligence.csv)
+    # that was never plumbed into the query at all before - a confirmed miss
+    # showed why that's a gap, not just an omission: the CitrixBleed findings'
+    # vulnerability_name ("Session Token Leak") lexically collides with PE-19
+    # ("Information Leakage" - a physical TEMPEST control, wrong domain
+    # entirely) enough that the cross-encoder ranked PE-19 first over SC-23
+    # (Session Authenticity), even though SC-23 was already the closer match
+    # by raw embedding distance. ti_summary's own wording ("harvest session
+    # tokens... bypass MFA") is concrete, on-target vocabulary the finding's
+    # other fields don't otherwise supply, and confirmed (via a repeated
+    # check across all 5 real findings) to flip only that one wrong-domain
+    # case without introducing a new one elsewhere - see README Supporting
+    # Question 2. Only added when a real match exists; nothing invented for
+    # findings without one.
+    if finding.has_threat_intel_match and finding.ti_summary:
+        query += f" Threat intel: {finding.ti_summary}"
+
+    return query
 
 
 def _base_control_id(control_id: str) -> str:
