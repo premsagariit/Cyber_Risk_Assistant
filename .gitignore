@@ -8,5 +8,7 @@ chroma_db/
 .pytest_cache/
 .streamlit/secrets.toml
 eval/traces/
-eval/
 AI_Cyber_Risk.docx
+ARCHITECTURE.md
+END_TO_END_FLOW.md
+report.md
